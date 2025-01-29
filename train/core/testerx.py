@@ -78,6 +78,160 @@ def get_bbox_valid(joints, img_height, img_width, rescale):
     return center, scale
 
 
+import scipy.signal as signal
+
+# from https://github.com/open-mmlab/mmhuman3d/tree/main
+class SGFilter:
+    """savgol_filter lib is from:
+    https://docs.scipy.org/doc/scipy/reference/generated/
+    scipy.signal.savgol_filter.html.
+
+    Args:
+        window_size (float):
+                    The length of the filter window
+                    (i.e., the number of coefficients).
+                    window_length must be a positive odd integer.
+        polyorder (int):
+                    The order of the polynomial used to fit the samples.
+                    polyorder must be less than window_length.
+
+    Returns:
+        smoothed poses (np.ndarray, torch.tensor)
+    """
+
+    def __init__(self, window_size=11, polyorder=2):
+        super(SGFilter, self).__init__()
+
+        # 1-D Savitzky-Golay filter
+        self.window_size = window_size
+        self.polyorder = polyorder
+
+    def __call__(self, x=None):
+        # x.shape: [t,k,c]
+        if self.window_size % 2 == 0:
+            window_size = self.window_size - 1
+        else:
+            window_size = self.window_size
+        if window_size > x.shape[0]:
+            window_size = x.shape[0]
+        if window_size <= self.polyorder:
+            polyorder = window_size - 1
+        else:
+            polyorder = self.polyorder
+        assert polyorder > 0
+        assert window_size > polyorder
+        if len(x.shape) != 3:
+            warnings.warn('x should be a tensor or numpy of [T*M,K,C]')
+        assert len(x.shape) == 3
+        x_type = x
+        if isinstance(x, torch.Tensor):
+            if x.is_cuda:
+                x = x.cpu().numpy()
+            else:
+                x = x.numpy()
+        smooth_poses = np.zeros_like(x)
+        # smooth at different axis
+        C = x.shape[-1]
+        for i in range(C):
+            smooth_poses[..., i] = signal.savgol_filter(
+                x[..., i], window_size, polyorder, axis=0)
+
+        if isinstance(x_type, torch.Tensor):
+            # we also return tensor by default
+            if x_type.is_cuda:
+                smooth_poses = torch.from_numpy(smooth_poses).cuda()
+            else:
+                smooth_poses = torch.from_numpy(smooth_poses)
+        return smooth_poses
+
+
+def smooth_process(x):
+
+    smooth_func = SGFilter()
+
+    if x.ndim == 4:
+        for i in range(x.shape[1]):
+            x[:, i] = smooth_func(x[:, i])
+    elif x.ndim == 3:
+        x = smooth_func(x)
+
+    return x
+
+
+from scipy.interpolate import interp1d
+import numpy as np
+import copy
+
+def perform_motion_interpolation(smpl_joints, pred_vert_arr, detection_all):
+
+    print("Do motion interpolation.")
+
+    smpl_joints_fill = np.copy(smpl_joints)
+    smpl_vertices_fill = np.copy(pred_vert_arr)
+    detection_all_fill = np.copy(detection_all)
+
+    person_count = len(set(detection_all[:, -1]))
+
+    for person in range(person_count):
+        choose_frame, choose_index, choose_joints, choose_vertices = [], [], [], []
+
+        for i in range(len(detection_all)):
+            frame_id, person_id = detection_all[i][0], detection_all[i][-1]
+            if person_id == person:
+                choose_frame.append(int(frame_id))
+                choose_index.append(len(choose_index))
+                choose_joints.append(smpl_joints[i])
+                choose_vertices.append(pred_vert_arr[i])
+
+        if len(choose_frame) < 3:
+            continue
+
+        existed_list = copy.copy(choose_frame)
+        interval = 10
+        choose_frame = choose_frame[0::interval]
+        choose_index = choose_index[0::interval]
+
+        choose_joints = np.stack(choose_joints, axis=0)  # (N, J_NUM, 3)
+        choose_vertices = np.stack(choose_vertices, axis=0)  # (N, V_NUM, 3)
+
+        choose_joints = interp1d(
+            choose_frame,
+            choose_joints[np.array(choose_index), :, :].transpose(1, 2, 0),
+            kind='linear'
+        )(range(int(min(choose_frame)), int(max(choose_frame)))).transpose(2, 0, 1)
+
+        choose_vertices = interp1d(
+            choose_frame,
+            choose_vertices[np.array(choose_index), :, :].transpose(1, 2, 0),
+            kind='linear'
+        )(range(int(min(choose_frame)), int(max(choose_frame)))).transpose(2, 0, 1)
+
+        print(f"Do motion smooth on person {person}.")
+        choose_joints = smooth_process(
+            choose_joints
+        )
+
+        infill_frame_ids = [
+            frame_id
+            for frame_id in range(int(min(choose_frame)), int(max(choose_frame)))
+            if frame_id not in existed_list
+        ]
+
+        print(f"Infill {len(infill_frame_ids)} frames for person {person}")
+        infill_seq = list(range(int(min(choose_frame)), int(max(choose_frame))))
+
+        for infill_frame_id in infill_frame_ids:
+            smpl_joints_fill_item = choose_joints[infill_seq.index(infill_frame_id)][np.newaxis, :]
+            smpl_vertices_fill_item = choose_vertices[infill_seq.index(infill_frame_id)][np.newaxis, :]
+            detection_all_fill_item = np.array([infill_frame_id, 0, 0, 0, 0, 0, 0, person])[np.newaxis, :]
+
+            smpl_joints_fill = np.append(smpl_joints_fill, smpl_joints_fill_item, axis=0)
+            smpl_vertices_fill = np.append(smpl_vertices_fill, smpl_vertices_fill_item, axis=0)
+            detection_all_fill = np.append(detection_all_fill, detection_all_fill_item, axis=0)
+
+    return smpl_joints_fill, smpl_vertices_fill, detection_all_fill
+
+
 def crop_tensor(image, center, bbox_size, crop_size, interpolation = 'bilinear', align_corners=False):
 
     dtype = image.dtype
@@ -212,7 +366,7 @@ class Tester:
         return bboxes
 
     @torch.no_grad()
-    def run_on_image_folder(self, all_image_folder, detections, output_folder, visualize_proj=False, save_result=False, eval_dataset=''):
+    def run_on_image_folder(self, all_image_folder, detections, output_folder, visualize_proj=False, save_result=False, eval_dataset='', from_one_video=False):
 
         for fold_idx, image_folder in enumerate(all_image_folder):
             image_file_names = [
@@ -221,6 +375,14 @@ class Tester:
                 if x.endswith('.png') or x.endswith('.jpg') or x.endswith('.jpeg')
             ]
             image_file_names = (sorted(image_file_names))
+
+            if from_one_video:
+                smpl_joints_fill = []
+                pred_vert_arr = []
+                detection_all = []
+                pose_arr = []
+                transpose_arr = []
+                shape_arr = []
 
             for img_idx, img_fname in tqdm.tqdm(enumerate(image_file_names)):
                 dets = detections[fold_idx][img_idx]
@@ -256,6 +418,9 @@ class Tester:
                     norm_img = self.normalize_img(rgb_img)
                     inp_images[det_idx] = norm_img.float().to(self.device)
 
+                    x1, y1, x2, y2 = bbox
+
+                    detection_all.append([img_idx, x1, y1, x2, y2, 0, 0.99, det_idx])
 
                 bbox_center = torch.tensor(bbox_center).cuda().float()
                 bbox_scale = torch.tensor(bbox_scale).cuda().float()
@@ -298,7 +463,22 @@ class Tester:
 
                 del inp_images
 
-                if save_result:
+                if from_one_video:
+                    smpl_joints_fill.extend(output['joints3d'].detach().cpu().numpy())
+                    vert = output['vertices'].detach().cpu().numpy()
+                    trans = output['pred_cam_t'].detach().cpu().numpy()
+                    vert = vert + np.expand_dims(trans, 1)
+
+                    pose = full_body_pred['pred_pose'].detach().cpu().numpy()
+                    shape = body_pred['pred_shape']
+
+                    pose_arr.extend(pose)
+                    transpose_arr.extend(trans)
+                    shape_arr.extend(shape)
+                    pred_vert_arr.extend(vert)
+
+
+                if save_result and not from_one_video:
                     for out_ind, vertices in enumerate(output['vertices']):
                         out_dict = {}
                         out_dict['verts'] = output['vertices'][out_ind].detach().cpu().numpy()
@@ -313,8 +493,9 @@ class Tester:
                             pickle.dump(out_dict, open(os.path.join(output_folder, imgname + '_personId_' + str(out_ind) + '.pkl'), 'wb'))
                         else:
                             raise Exception('eval dataset can be either agora or bedlam')
+                        
 
-                if visualize_proj:
+                if visualize_proj and not from_one_video:
                     img_h, img_w, _ = img.shape
                     focal_length = (img_w * img_w + img_h * img_h) ** 0.5
 
@@ -336,6 +517,57 @@ class Tester:
                     orig_path = os.path.join(output_folder, filename_orig)
                     logger.info(f'Writing output files to {output_folder}')
                     cv2.imwrite(front_view_path, front_view[:, :, ::-1])
-                    cv2.imwrite(orig_path, img[:, :, ::-1])
+                    # cv2.imwrite(orig_path, img[:, :, ::-1])
 
                     renderer.delete()
+
+            if from_one_video:
+                pred_vert_arr = np.array(pred_vert_arr)
+                smpl_joints_fill = np.array(smpl_joints_fill)
+                detection_all = np.array(detection_all)
+                pose_arr = np.array(pose_arr)
+                transpose_arr = np.array(transpose_arr)
+                shape_arr = np.array(shape_arr)
+
+                smpl_joints, smpl_vertices, detection_all = perform_motion_interpolation(smpl_joints_fill, pred_vert_arr, detection_all)
+
+                if save_result:
+                    # Same format as the original Cliff paper demo
+                    np.savez(os.path.join(output_folder, 'predicted_joints_bedlam.npy'),
+                             pose=pose_arr,
+                             shape=shape_arr,
+                             global_t=transpose_arr,
+                             pred_joints=smpl_joints,
+                             detection_all=detection_all)
+
+                if visualize_proj:
+
+                    frames_id = detection_all[:, 0]
+
+                    front_view_path = os.path.join(output_folder, 'result_video_bedlam.mp4')
+                    frame_rate = 30  # Frames per second
+
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec for MP4
+                    img_h, img_w, _ = img.shape
+                    video_writer = cv2.VideoWriter(front_view_path, fourcc, frame_rate, (img_w, img_h))
+
+                    for img_idx, img_fname in tqdm.tqdm(enumerate(image_file_names)):
+
+                        frames_id = detection_all[:, 0]
+
+                        pred_vertices_array = smpl_vertices[frames_id == img_idx]
+
+                        img = cv2.cvtColor(cv2.imread(img_fname), cv2.COLOR_BGR2RGB)
+                        img_h, img_w, _ = img.shape
+                        focal_length = (img_w * img_w + img_h * img_h) ** 0.5
+
+                        renderer = Renderer(focal_length=focal_length, img_w=img_w, img_h=img_h,
+                                            faces=self.smpl_cam_head.smplx.faces,
+                                            same_mesh_color=False)
+
+                        front_view = renderer.render_front_view(pred_vertices_array,
+                                                                bg_img_rgb=img.copy())
+                        renderer.delete()
+                        video_writer.write(front_view[:, :, ::-1])
+                    video_writer.release()
+
