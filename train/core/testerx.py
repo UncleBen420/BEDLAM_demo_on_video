@@ -470,7 +470,7 @@ class Tester:
                     vert = vert + np.expand_dims(trans, 1)
 
                     pose = full_body_pred['pred_pose'].detach().cpu().numpy()
-                    shape = body_pred['pred_shape']
+                    shape = body_pred['pred_shape'].detach().cpu().numpy()
 
                     pose_arr.extend(pose)
                     transpose_arr.extend(trans)
